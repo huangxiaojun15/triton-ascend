@@ -107,7 +107,7 @@ jobs:
           ccache --zero-stats
           NUM_PROCS=$(( $(nproc) / 3 ))
           if [ "$NUM_PROCS" -lt 1 ]; then NUM_PROCS=1; fi
-          MAX_JOBS="$NUM_PROCS" ${PYTHON} setup.py bdist_wheel
+          MAX_JOBS="$NUM_PROCS" TRITON_BUILD_TD=ON ${PYTHON} setup.py bdist_wheel
           ${PYTHON} -m pip install -v dist/*.whl --force-reinstall
 
 

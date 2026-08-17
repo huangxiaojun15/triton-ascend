@@ -633,7 +633,7 @@ def ensure_distributed_submodule():
     if not check_env_flag("TRITON_BUILD_TD", "OFF"):
         return
     distributed_dir = Path(triton_dir) / "third_party" / "ascend" / "Triton-distributed-ascend"
-    commit_id = "24036fa622d8291f657133e3d8db75a7ec6796c2"
+    commit_id = "3539abd55c8f07c028a45b0f06b0a1e18ad14599"
     if not distributed_dir.is_dir():
         subprocess.check_call([
             "git",
@@ -644,6 +644,11 @@ def ensure_distributed_submodule():
         ], cwd=Path(triton_dir) / "third_party" / "ascend")
     if is_git_repo():
         add_git_safe_dir(str(distributed_dir))
+        subprocess.check_call([
+            "git",
+            "fetch",
+            "origin",
+        ], cwd=distributed_dir)
         subprocess.check_call([
             "git",
             "checkout",

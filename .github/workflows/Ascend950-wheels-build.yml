@@ -78,7 +78,7 @@ jobs:
           NUM_PROCS=$(( $(nproc) / 3 ))
           if [ "$NUM_PROCS" -lt 1 ]; then NUM_PROCS=1; fi
           cd python
-          MAX_JOBS="$NUM_PROCS" python setup.py bdist_wheel --dist-dir="${GITHUB_WORKSPACE}/wheelhouse"
+          MAX_JOBS="$NUM_PROCS" TRITON_BUILD_TD=ON python setup.py bdist_wheel --dist-dir="${GITHUB_WORKSPACE}/wheelhouse"
 
       - uses: actions/upload-artifact@v4
         with:
