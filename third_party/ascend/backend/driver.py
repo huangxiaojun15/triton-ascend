@@ -418,8 +418,56 @@ def generate_npu_header_src():
 #include <sys/syscall.h>
 #include <vector>
 #include <Python.h>
-#include "runtime/runtime/rt.h"
+#ifdef TRITON_CANN_910
 #include <acl/acl.h>
+#else
+#include "runtime/runtime/rt.h"
+#endif
+
+// Compatibility shim for CANN runtime API transition (rt -> aclrt in 9.0.0).
+#ifdef TRITON_CANN_910
+using triton_rt_error_t = aclError;
+using triton_rt_stream_t = aclrtStream;
+using triton_rt_func_handle_t = aclrtFuncHandle;
+using triton_rt_memcpy_kind = aclrtMemcpyKind;
+static constexpr triton_rt_error_t TRITON_RT_SUCCESS = ACL_SUCCESS;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_HOST_TO_HOST = ACL_MEMCPY_HOST_TO_HOST;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_HOST_TO_DEVICE = ACL_MEMCPY_HOST_TO_DEVICE;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_DEVICE_TO_HOST = ACL_MEMCPY_DEVICE_TO_HOST;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_DEVICE_TO_DEVICE = ACL_MEMCPY_DEVICE_TO_DEVICE;
+static inline triton_rt_error_t triton_rt_malloc_host(void **ptr, size_t size) {{ return aclrtMallocHost(ptr, size); }}
+static inline triton_rt_error_t triton_rt_free_host(void *ptr) {{ return aclrtFreeHost(ptr); }}
+static inline triton_rt_error_t triton_rt_memcpy(void *dst, size_t destMax, const void *src, size_t count, triton_rt_memcpy_kind kind) {{ return aclrtMemcpy(dst, destMax, src, count, kind); }}
+static inline triton_rt_error_t triton_rt_memset_async(void *dst, size_t destMax, int32_t value, size_t count, triton_rt_stream_t stream) {{ return aclrtMemsetAsync(dst, destMax, value, count, stream); }}
+static inline triton_rt_error_t triton_rt_synchronize_stream(triton_rt_stream_t stream) {{ return aclrtSynchronizeStream(stream); }}
+static inline const char *triton_rt_get_soc_name() {{ return aclrtGetSocName(); }}
+static inline triton_rt_error_t triton_rt_get_hardware_sync_addr(void **addr) {{ return aclrtGetHardwareSyncAddr(addr); }}
+static inline triton_rt_error_t triton_rt_launch_kernel(triton_rt_func_handle_t func, uint32_t block_dim, triton_rt_stream_t stream, void *cfg, void *args, size_t arg_size) {{
+  return aclrtLaunchKernelWithHostArgs(func, block_dim, stream, static_cast<aclrtLaunchKernelCfg *>(cfg), args, arg_size, nullptr, 0);
+}}
+#else
+using triton_rt_error_t = rtError_t;
+using triton_rt_stream_t = rtStream_t;
+using triton_rt_func_handle_t = const void*;
+using triton_rt_memcpy_kind = rtMemcpyKind_t;
+static constexpr triton_rt_error_t TRITON_RT_SUCCESS = RT_ERROR_NONE;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_HOST_TO_HOST = RT_MEMCPY_HOST_TO_HOST;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_HOST_TO_DEVICE = RT_MEMCPY_HOST_TO_DEVICE;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_DEVICE_TO_HOST = RT_MEMCPY_DEVICE_TO_HOST;
+static constexpr triton_rt_memcpy_kind TRITON_RT_MEMCPY_DEVICE_TO_DEVICE = RT_MEMCPY_DEVICE_TO_DEVICE;
+static inline triton_rt_error_t triton_rt_malloc_host(void **ptr, size_t size) {{ return rtMallocHost(ptr, size, RT_MEMORY_HOST); }}
+static inline triton_rt_error_t triton_rt_free_host(void *ptr) {{ return rtFreeHost(ptr); }}
+static inline triton_rt_error_t triton_rt_memcpy(void *dst, size_t destMax, const void *src, size_t count, triton_rt_memcpy_kind kind) {{ return rtMemcpy(dst, destMax, src, count, kind); }}
+static inline triton_rt_error_t triton_rt_memset_async(void *dst, size_t destMax, int32_t value, size_t count, triton_rt_stream_t stream) {{ return rtMemsetAsync(dst, destMax, value, count, stream); }}
+static inline triton_rt_error_t triton_rt_synchronize_stream(triton_rt_stream_t stream) {{ return rtStreamSynchronize(stream); }}
+static inline const char *triton_rt_get_soc_name() {{ static thread_local char name[64] = {{}}; if (rtGetSocVersion(name, sizeof(name)) != RT_ERROR_NONE) return nullptr; return name; }}
+static inline triton_rt_error_t triton_rt_get_hardware_sync_addr(void **addr) {{ uint32_t len = 0; return rtGetC2cCtrlAddr(reinterpret_cast<uint64_t *>(addr), &len); }}
+static inline triton_rt_error_t triton_rt_launch_kernel(triton_rt_func_handle_t func, uint32_t block_dim, triton_rt_stream_t stream, void *cfg, void *args, size_t arg_size) {{
+  (void)cfg;
+  return rtKernelLaunch(func, block_dim, args, arg_size, stream);
+}}
+#endif
+
 {get_backend_func("header_file", enable_taskqueue)}
 #endif
 """
@@ -576,22 +624,21 @@ static inline size_t _align_launch_offset(size_t offset, size_t alignment) {
   return (offset + alignment - 1) & ~(alignment - 1);
 }
 
-// aclrtGetHardwareSyncAddr returns a per-process per-stream constant address;
+// triton_rt_get_hardware_sync_addr returns a per-process per-stream constant address;
 // re-querying it on every kernel launch is pure overhead. Cache the most
 // recently observed (stream, ffts_addr) pair on the calling thread.
 // Thread-safety: launch_call is invoked synchronously from the launcher thread
 // by triton_async_launch (see npu_utils.cpp), so thread_local is safe.
-static thread_local aclrtStream g_last_ffts_stream = nullptr;
+static thread_local triton_rt_stream_t g_last_ffts_stream = nullptr;
 static thread_local void* g_last_ffts_addr = nullptr;
-static inline aclError get_ffts_addr(aclrtStream stream, void** out_addr) {
+static inline triton_rt_error_t get_ffts_addr(triton_rt_stream_t stream, void** out_addr) {
   if (stream == g_last_ffts_stream && g_last_ffts_addr) {
     *out_addr = g_last_ffts_addr;
-    return ACL_SUCCESS;
+    return TRITON_RT_SUCCESS;
   }
   void* ffts_addr = nullptr;
-  uint32_t ffts_len = 0;
-  aclError ret = aclrtGetHardwareSyncAddr(&ffts_addr);
-  if (ret == ACL_SUCCESS) {
+  triton_rt_error_t ret = triton_rt_get_hardware_sync_addr(&ffts_addr);
+  if (ret == TRITON_RT_SUCCESS) {
     g_last_ffts_stream = stream;
     g_last_ffts_addr = ffts_addr;
     *out_addr = ffts_addr;
@@ -658,17 +705,17 @@ def make_launcher(constants, signature, metadata):
          lockOffset += syncBlockLockStrideI64) {{
       lockInitData[lockOffset] = syncBlockLockParticipantNum;
     }}
-    ret = aclrtMemcpy(syncBlockLock_ptr, syncBlockLockSize,
+    ret = triton_rt_memcpy(syncBlockLock_ptr, syncBlockLockSize,
                    reinterpret_cast<void *>(lockInitData.data()),
-                   syncBlockLockSize, ACL_MEMCPY_HOST_TO_DEVICE);"""
+                   syncBlockLockSize, TRITON_RT_MEMCPY_HOST_TO_DEVICE);"""
     elif lock_init_value == 0:
-        lock_init_stmt = ("ret = aclrtMemsetAsync(syncBlockLock_ptr, syncBlockLockSize, 0, "
+        lock_init_stmt = ("ret = triton_rt_memset_async(syncBlockLock_ptr, syncBlockLockSize, 0, "
                           "syncBlockLockSize, stream);")
     else:
         lock_init_stmt = (f"std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});\n"
-                          "    ret = aclrtMemcpy(syncBlockLock_ptr, syncBlockLockSize, "
+                          "    ret = triton_rt_memcpy(syncBlockLock_ptr, syncBlockLockSize, "
                           "reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize, "
-                          "ACL_MEMCPY_HOST_TO_DEVICE);")
+                          "TRITON_RT_MEMCPY_HOST_TO_DEVICE);")
     bs_task_type = metadata.bs_task_type if hasattr(metadata, 'bs_task_type') else 0
     mix_mode = metadata.mix_mode
     compile_on_910_95 = metadata.compile_on_910_95
@@ -1064,10 +1111,11 @@ static void release_npu_tensor_handle(void* handle) {{
 """
 
     def _make_kernel_launch(args_ptr, args_size, indent="    "):
-        cfg = "&cfgCfgInfo" if (compile_on_910_95 and enable_simt) else "nullptr"
+        need_cfg = compile_on_910_95 and enable_simt
         cfg_setup = ""
-        if compile_on_910_95 and enable_simt:
-            cfg_setup = f"""{indent}aclrtLaunchKernelAttr attrInfo = {{}};
+        if need_cfg:
+            cfg_setup = f"""{indent}#ifdef TRITON_CANN_910
+{indent}aclrtLaunchKernelAttr attrInfo = {{}};
 {indent}attrInfo.id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
 {indent}aclrtLaunchKernelAttrValue value = {{}};
 {indent}value.localMemorySize = {metadata.shared_mem_dynamic_size};
@@ -1075,8 +1123,14 @@ static void release_npu_tensor_handle(void* handle) {{
 {indent}aclrtLaunchKernelCfg cfgCfgInfo = {{}};
 {indent}cfgCfgInfo.attrs = &attrInfo;
 {indent}cfgCfgInfo.numAttrs = 1;
+{indent}void *kernel_cfg = &cfgCfgInfo;
+{indent}#else
+{indent}void *kernel_cfg = nullptr;
+{indent}#endif
 """
-        return f"""{cfg_setup}{indent}ret = aclrtLaunchKernelWithHostArgs(func, blockNum, stream, {cfg}, {args_ptr}, {args_size}, nullptr, 0);
+        else:
+            cfg_setup = f"{indent}void *kernel_cfg = nullptr;\n"
+        return f"""{cfg_setup}{indent}ret = triton_rt_launch_kernel(func, blockNum, stream, kernel_cfg, {args_ptr}, {args_size});
 """
 
     cpp_kernel_launch = _make_kernel_launch("static_cast<void*>(launch_args.data())", "launch_args.size()")
@@ -1099,7 +1153,7 @@ static void release_npu_tensor_handle(void* handle) {{
   }}
   ''' if workspace_size > 0 else ''}"""
 
-    _launch_lambda_pre = f"""  {'std::function<aclError()> launch_call = [=]() -> aclError' if enable_taskqueue else ''} {{
+    _launch_lambda_pre = f"""  {'std::function<triton_rt_error_t()> launch_call = [=]() -> triton_rt_error_t' if enable_taskqueue else ''} {{
     {get_backend_func("pre_launch", False)}
     uint32_t blockNum = gridX * gridY * gridZ;
 
@@ -1116,9 +1170,9 @@ static void release_npu_tensor_handle(void* handle) {{
     uint32_t nodeBasicBlockDim = (mixBlockNumRation << 16) + blockNum;
 
     {'cce::internal::DebugTunnelData *DTData = cce::internal::DebugTunnel::Open(blockNum);' if enable_device_print else ''}
-    aclError ret = ACL_SUCCESS;
+    triton_rt_error_t ret = TRITON_RT_SUCCESS;
     {'void *ffts_addr = nullptr; ret = get_ffts_addr(stream, &ffts_addr);' if target_support_ffts else ''}
-    {'if (ret != ACL_SUCCESS) return ret;' if (target_support_ffts and enable_taskqueue) else 'if (ret != ACL_SUCCESS) return;' if (target_support_ffts and (not enable_taskqueue)) else ''}
+    {'if (ret != TRITON_RT_SUCCESS) return ret;' if (target_support_ffts and enable_taskqueue) else 'if (ret != TRITON_RT_SUCCESS) return;' if (target_support_ffts and (not enable_taskqueue)) else ''}
     // stub argument for workspace
     void *syncBlockLock_ptr = nullptr;
     void *syncBlockLock_handle = nullptr;
@@ -1131,11 +1185,11 @@ static void release_npu_tensor_handle(void* handle) {{
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
     {lock_init_stmt}
-    if (ret != ACL_SUCCESS) {{
+    if (ret != TRITON_RT_SUCCESS) {{
       return {'ret' if enable_taskqueue else ''};
     }}
     ''' if lock_num > 0 else ''}
-    {'if (ret != ACL_SUCCESS) {{ return ret; }}' if (workspace_size > 0 and enable_taskqueue) else 'if (ret != ACL_SUCCESS) {{ return; }}' if (workspace_size > 0 and not enable_taskqueue) else ''}"""
+    {'if (ret != TRITON_RT_SUCCESS) {{ return ret; }}' if (workspace_size > 0 and enable_taskqueue) else 'if (ret != TRITON_RT_SUCCESS) {{ return; }}' if (workspace_size > 0 and not enable_taskqueue) else ''}"""
 
     _launch_lambda_post = f"""
     {cpp_msprof_call_before_launch}
@@ -1143,7 +1197,7 @@ static void release_npu_tensor_handle(void* handle) {{
     {'void*& stream_ref = const_cast<void*&>(stream);' if enable_device_print else ''}
     {'cce::internal::DebugTunnel::Close(DTData, stream_ref);' if enable_device_print else ''}
     {cpp_msprof_call_after_launch}
-    {'return ret;' if enable_taskqueue else 'ret = aclrtSynchronizeStream(stream);'}
+    {'return ret;' if enable_taskqueue else 'ret = triton_rt_synchronize_stream(stream);'}
   }};
   {f'''{get_backend_func("async_launch", "launch_call") if enable_taskqueue else ''}'''}
   return;
@@ -1168,7 +1222,7 @@ static void release_npu_tensor_handle(void* handle) {{
 {_CPP_ALIGN_LAUNCH_OFFSET}
 
 extern "C" {{
-void triton_launch_kernel(const char* kernelName, aclrtFuncHandle func, aclrtStream stream,
+void triton_launch_kernel(const char* kernelName, triton_rt_func_handle_t func, triton_rt_stream_t stream,
     int gridX, int gridY, int gridZ,
     const int64_t* shapes_data, const int* shape_dims, int num_tensors,
     const int* tensor_kinds,
@@ -1260,7 +1314,7 @@ void triton_launch_kernel(const char* kernelName, aclrtFuncHandle func, aclrtStr
 {_launch_lambda_post.replace('__KERNEL_LAUNCH_CALL__', cpp_kernel_launch)}
 }} // extern "C"
 
-static void _launch(const char* kernelName, aclrtFuncHandle func, aclrtStream stream,
+static void _launch(const char* kernelName, triton_rt_func_handle_t func, triton_rt_stream_t stream,
     int gridX, int gridY, int gridZ,
     std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds,
     void *global_scratch, void *profile_scratch{(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
@@ -1298,8 +1352,8 @@ static void _launch(const char* kernelName, aclrtFuncHandle func, aclrtStream st
 
 static PyObject* launch(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {{
   int gridX, gridY, gridZ;
-  aclrtStream stream;
-  aclrtFuncHandle function;
+  triton_rt_stream_t stream;
+  triton_rt_func_handle_t function;
   PyObject *packedMetadata = nullptr;
   PyObject *launch_metadata = nullptr;
   PyObject *launch_enter_hook = nullptr;
@@ -1319,8 +1373,8 @@ static PyObject* launch(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
   gridX = (int)PyLong_AsLong(args[0]);
   gridY = (int)PyLong_AsLong(args[1]);
   gridZ = (int)PyLong_AsLong(args[2]);
-  stream = reinterpret_cast<aclrtStream>(PyLong_AsUnsignedLongLong(args[3]));
-  function = reinterpret_cast<aclrtFuncHandle>(PyLong_AsUnsignedLongLong(args[4]));
+  stream = reinterpret_cast<triton_rt_stream_t>(PyLong_AsUnsignedLongLong(args[3]));
+  function = reinterpret_cast<triton_rt_func_handle_t>(PyLong_AsUnsignedLongLong(args[4]));
   global_scratch_obj = args[5];
   profile_scratch_obj = args[6];
   packedMetadata = args[7];

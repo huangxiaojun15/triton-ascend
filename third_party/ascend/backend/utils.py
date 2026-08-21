@@ -33,6 +33,9 @@ from triton.backends.ascend.backend_register import backend_strategy_registry
 
 import pybind11
 
+_cann_version = None
+_cann_version_checked = False
+
 # Phase-one compatibility boundary for compile-option cleanup.  Keep the
 # existing NPUOptions fields and their internal consumers intact while public
 # dictionaries route supported aliases and drop backend-managed fields.
@@ -536,6 +539,7 @@ def _build_npu_ext(obj_name: str, header_or_src_path, src_path=None, *, kernel_l
         else:
             cc_cmd += get_backend_func("get_cc_cmd")
 
+    cc_cmd += cann_version_compile_args()
     cc_cmd += ["-std=c++17", "-shared", "-fPIC", "-o", so_path]
 
     result = subprocess.run(cc_cmd, capture_output=True, text=True)
@@ -666,6 +670,66 @@ def is_ffts_supported(arch: str):
 def force_disable_ffts(arch: str) -> bool:
     """Return whether the selected target requires FFTS to be disabled."""
     return is_compile_on_910_95(arch)
+
+def _parse_cann_version(line: str):
+    m = re.search(r'(\d+)\.(\d+)(?:\.(\d+))?', line)
+    if m:
+        major = int(m.group(1))
+        minor = int(m.group(2))
+        patch = int(m.group(3)) if m.group(3) is not None else 0
+        return (major, minor, patch)
+    return None
+
+
+def _find_cann_version_file():
+    ascend_path = str(_get_ascend_path())
+    arch = get_machine_arch()
+    candidates = [
+        os.path.join(ascend_path, arch + "-linux", "ascend_toolkit_install.info"),
+        os.path.join(ascend_path, arch + "-linux", "ascend_all_cann_install.info"),
+        os.path.join(ascend_path, "version.info"),
+        os.path.join(ascend_path, arch + "-linux", "version.info"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def get_cann_version():
+    global _cann_version, _cann_version_checked
+    if _cann_version_checked:
+        return _cann_version
+    _cann_version_checked = True
+    try:
+        version_file = _find_cann_version_file()
+        if version_file is None:
+            _cann_version = None
+            return None
+        with open(version_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if "version" in line.lower():
+                    parsed = _parse_cann_version(line)
+                    if parsed is not None:
+                        _cann_version = parsed
+                        return _cann_version
+        _cann_version = None
+    except Exception:
+        _cann_version = None
+    return _cann_version
+
+
+def is_cann_version_at_least(major: int, minor: int = 0, patch: int = 0) -> bool:
+    v = get_cann_version()
+    if v is None:
+        return False
+    return v >= (major, minor, patch)
+
+def cann_version_compile_args():
+    if is_cann_version_at_least(9, 1, 0):
+        return ["-DTRITON_CANN_910"]
+    return []
 
 
 def get_cann_version_file_hash():
