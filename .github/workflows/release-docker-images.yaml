@@ -1,13 +1,8 @@
-name: Release Docker Images Nightly
+name: Release Docker Images
 
 on:
   workflow_dispatch:
     inputs:
-      tag_suffix:
-        description: "附加到标准镜像 tag 后的可选后缀，例如 nightly、B021"
-        required: false
-        type: string
-        default: nightly
       push_images:
         description: "是否登录 registry 并推送镜像；在 fork 中无凭据时可关闭"
         required: false
@@ -18,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-docker-nightly-${{ github.ref }}
+  group: release-docker-images-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -130,8 +125,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-    env:
-      TAG_SUFFIX: ${{ inputs.tag_suffix }}
     strategy:
       fail-fast: false
       matrix:
@@ -178,14 +171,11 @@ jobs:
           docker buildx imagetools inspect "${amd64_image}" >/dev/null
           docker buildx imagetools inspect "${arm64_image}" >/dev/null
 
-          # SWR 保持原有标准 tag 和可选后缀 tag。
-          destinations=("${IMAGE_REPOSITORY}:${BASE_TAG}")
-          if [[ -n "${TAG_SUFFIX}" ]]; then
-            destinations+=("${IMAGE_REPOSITORY}:${BASE_TAG}-${TAG_SUFFIX}")
-          fi
-
-          # Quay 只发布 9 个标准多架构 tag，不发布架构临时 tag 或 nightly 后缀。
-          destinations+=("${QUAY_IMAGE_REPOSITORY}:${BASE_TAG}")
+          # SWR 和 Quay 都只发布标准多架构 tag。
+          destinations=(
+            "${IMAGE_REPOSITORY}:${BASE_TAG}"
+            "${QUAY_IMAGE_REPOSITORY}:${BASE_TAG}"
+          )
 
           tags=()
           for destination in "${destinations[@]}"; do
