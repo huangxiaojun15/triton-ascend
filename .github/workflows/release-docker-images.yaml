@@ -25,7 +25,7 @@ env:
   # 华为云 SWR 镜像仓库。
   REGISTRY: swr.cn-north-4.myhuaweicloud.com
   IMAGE_REPOSITORY: swr.cn-north-4.myhuaweicloud.com/opentile/triton
-  # 同步发布到 Quay.io，镜像名与 tag 保持和 SWR 一致。
+  # Quay.io 只发布 9 个多架构标准 tag。
   QUAY_REGISTRY: quay.io
   QUAY_IMAGE_REPOSITORY: quay.io/ascend/triton
 
@@ -83,14 +83,6 @@ jobs:
           access-key-id: ${{ secrets.HUAWEI_CLOUD_AK }}
           access-key-secret: ${{ secrets.HUAWEI_CLOUD_SK }}
 
-      - name: Log in to Quay.io
-        if: ${{ env.PUSH_IMAGE == 'true' }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.QUAY_REGISTRY }}
-          username: ${{ secrets.QUAY_ROBOT_USERNAME }}
-          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
-
       - name: Generate image tags
         id: tags
         run: |
@@ -113,9 +105,7 @@ jobs:
           outputs: ${{ env.PUSH_IMAGE == 'true' && 'type=registry,oci-mediatypes=false' || '' }}
           provenance: false
           sbom: false
-          tags: |
-            ${{ env.IMAGE_REPOSITORY }}:${{ steps.tags.outputs.arch_tag }}
-            ${{ env.QUAY_IMAGE_REPOSITORY }}:${{ steps.tags.outputs.arch_tag }}
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ steps.tags.outputs.arch_tag }}
           labels: |
             org.opencontainers.image.title=Triton-Ascend
             org.opencontainers.image.description=Triton-Ascend ${{ env.TRITON_ASCEND_VERSION }} for ${{ matrix.device_type }} on ${{ matrix.os.name }} (${{ matrix.platform.arch }})
@@ -188,14 +178,14 @@ jobs:
           docker buildx imagetools inspect "${amd64_image}" >/dev/null
           docker buildx imagetools inspect "${arm64_image}" >/dev/null
 
-          destinations=()
-          for repository in "${IMAGE_REPOSITORY}" "${QUAY_IMAGE_REPOSITORY}"; do
-            final_image="${repository}:${BASE_TAG}"
-            destinations+=("${final_image}")
-            if [[ -n "${TAG_SUFFIX}" ]]; then
-              destinations+=("${final_image}-${TAG_SUFFIX}")
-            fi
-          done
+          # SWR 保持原有标准 tag 和可选后缀 tag。
+          destinations=("${IMAGE_REPOSITORY}:${BASE_TAG}")
+          if [[ -n "${TAG_SUFFIX}" ]]; then
+            destinations+=("${IMAGE_REPOSITORY}:${BASE_TAG}-${TAG_SUFFIX}")
+          fi
+
+          # Quay 只发布 9 个标准多架构 tag，不发布架构临时 tag 或 nightly 后缀。
+          destinations+=("${QUAY_IMAGE_REPOSITORY}:${BASE_TAG}")
 
           tags=()
           for destination in "${destinations[@]}"; do
@@ -215,3 +205,9 @@ jobs:
 
           echo "Published multi-arch tags:"
           printf '  %s\n' "${destinations[@]}"
+
+          quay_image="${QUAY_IMAGE_REPOSITORY}:${BASE_TAG}"
+          quay_manifest="$(docker buildx imagetools inspect "${quay_image}")"
+          grep -q "linux/amd64" <<<"${quay_manifest}"
+          grep -q "linux/arm64" <<<"${quay_manifest}"
+          echo "Verified Quay multi-arch manifest: ${quay_image}"
