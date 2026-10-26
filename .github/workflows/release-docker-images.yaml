@@ -1,4 +1,4 @@
-name: Release Docker Images
+name: Release Docker Images Nightly
 
 on:
   workflow_dispatch:
